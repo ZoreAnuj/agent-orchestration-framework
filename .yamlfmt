@@ -1,0 +1,5 @@
+formatter:
+  retain_line_breaks: true
+exclude:
+  - internal/manifests/install-crd.yaml
+  - internal/manifests/charts/kelos/templates/

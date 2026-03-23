@@ -1,0 +1,2204 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+
+	ctrl "sigs.k8s.io/controller-runtime"
+
+	kelosv1alpha1 "github.com/kelos-dev/kelos/api/v1alpha1"
+	"github.com/kelos-dev/kelos/internal/reporting"
+	"github.com/kelos-dev/kelos/internal/source"
+)
+
+type fakeSource struct {
+	items []source.WorkItem
+}
+
+func (f *fakeSource) Discover(_ context.Context) ([]source.WorkItem, error) {
+	return f.items, nil
+}
+
+func newTestScheme() *runtime.Scheme {
+	s := runtime.NewScheme()
+	utilruntime.Must(clientgoscheme.AddToScheme(s))
+	utilruntime.Must(kelosv1alpha1.AddToScheme(s))
+	return s
+}
+
+func int32Ptr(v int32) *int32 { return &v }
+func boolPtr(v bool) *bool    { return &v }
+
+func setupTest(t *testing.T, ts *kelosv1alpha1.TaskSpawner, existingTasks ...kelosv1alpha1.Task) (client.Client, types.NamespacedName) {
+	t.Helper()
+	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
+
+	objs := []client.Object{ts}
+	for i := range existingTasks {
+		objs = append(objs, &existingTasks[i])
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(newTestScheme()).
+		WithObjects(objs...).
+		WithStatusSubresource(ts).
+		Build()
+
+	key := types.NamespacedName{Name: ts.Name, Namespace: ts.Namespace}
+	return cl, key
+}
+
+func newTaskSpawner(name, namespace string, maxConcurrency *int32) *kelosv1alpha1.TaskSpawner {
+	return &kelosv1alpha1.TaskSpawner{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: kelosv1alpha1.TaskSpawnerSpec{
+			When: kelosv1alpha1.When{
+				GitHubIssues: &kelosv1alpha1.GitHubIssues{},
+			},
+			TaskTemplate: kelosv1alpha1.TaskTemplate{
+				Type: "claude-code",
+				Credentials: kelosv1alpha1.Credentials{
+					Type:      kelosv1alpha1.CredentialTypeOAuth,
+					SecretRef: kelosv1alpha1.SecretReference{Name: "creds"},
+				},
+				WorkspaceRef: &kelosv1alpha1.WorkspaceReference{Name: "test-ws"},
+			},
+			MaxConcurrency: maxConcurrency,
+		},
+	}
+}
+
+func newTask(name, namespace, spawnerName string, phase kelosv1alpha1.TaskPhase) kelosv1alpha1.Task {
+	return kelosv1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels: map[string]string{
+				"kelos.dev/taskspawner": spawnerName,
+			},
+		},
+		Spec: kelosv1alpha1.TaskSpec{
+			Type:   "claude-code",
+			Prompt: "test",
+			Credentials: kelosv1alpha1.Credentials{
+				Type:      kelosv1alpha1.CredentialTypeOAuth,
+				SecretRef: kelosv1alpha1.SecretReference{Name: "creds"},
+			},
+		},
+		Status: kelosv1alpha1.TaskStatus{
+			Phase: phase,
+		},
+	}
+}
+
+func TestBuildSource_GitHubIssuesWithBaseURL(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+
+	src, err := buildSource(ts, "my-org", "my-repo", "https://github.example.com/api/v3", "", "", "", "", nil)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	ghSrc, ok := src.(*source.GitHubSource)
+	if !ok {
+		t.Fatalf("Expected *source.GitHubSource, got %T", src)
+	}
+	if ghSrc.BaseURL != "https://github.example.com/api/v3" {
+		t.Errorf("BaseURL = %q, want %q", ghSrc.BaseURL, "https://github.example.com/api/v3")
+	}
+	if ghSrc.Owner != "my-org" {
+		t.Errorf("Owner = %q, want %q", ghSrc.Owner, "my-org")
+	}
+	if ghSrc.Repo != "my-repo" {
+		t.Errorf("Repo = %q, want %q", ghSrc.Repo, "my-repo")
+	}
+}
+
+func TestBuildSource_GitHubIssuesDefaultBaseURL(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+
+	src, err := buildSource(ts, "kelos-dev", "kelos", "", "", "", "", "", nil)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	ghSrc, ok := src.(*source.GitHubSource)
+	if !ok {
+		t.Fatalf("Expected *source.GitHubSource, got %T", src)
+	}
+	if ghSrc.BaseURL != "" {
+		t.Errorf("BaseURL = %q, want empty (defaults to api.github.com)", ghSrc.BaseURL)
+	}
+}
+
+func TestBuildSource_GitHubPullRequests(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+	ts.Spec.When = kelosv1alpha1.When{
+		GitHubPullRequests: &kelosv1alpha1.GitHubPullRequests{
+			State:           "open",
+			ReviewState:     "changes_requested",
+			TriggerComment:  "/kelos pick-up",
+			ExcludeComments: []string{"/kelos needs-input"},
+			Draft:           boolPtr(false),
+		},
+	}
+
+	src, err := buildSource(ts, "kelos-dev", "kelos", "https://github.example.com/api/v3", "", "", "", "", nil)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	ghSrc, ok := src.(*source.GitHubPullRequestSource)
+	if !ok {
+		t.Fatalf("Expected *source.GitHubPullRequestSource, got %T", src)
+	}
+	if ghSrc.BaseURL != "https://github.example.com/api/v3" {
+		t.Errorf("BaseURL = %q, want %q", ghSrc.BaseURL, "https://github.example.com/api/v3")
+	}
+	if ghSrc.Owner != "kelos-dev" {
+		t.Errorf("Owner = %q, want %q", ghSrc.Owner, "kelos-dev")
+	}
+	if ghSrc.Repo != "kelos" {
+		t.Errorf("Repo = %q, want %q", ghSrc.Repo, "kelos")
+	}
+	if ghSrc.ReviewState != "changes_requested" {
+		t.Errorf("ReviewState = %q, want %q", ghSrc.ReviewState, "changes_requested")
+	}
+	if ghSrc.TriggerComment != "/kelos pick-up" {
+		t.Errorf("TriggerComment = %q, want %q", ghSrc.TriggerComment, "/kelos pick-up")
+	}
+	if len(ghSrc.ExcludeComments) != 1 || ghSrc.ExcludeComments[0] != "/kelos needs-input" {
+		t.Errorf("ExcludeComments = %v, want %v", ghSrc.ExcludeComments, []string{"/kelos needs-input"})
+	}
+	if ghSrc.Draft == nil || *ghSrc.Draft {
+		t.Errorf("Draft = %v, want false", ghSrc.Draft)
+	}
+}
+
+func TestBuildSource_Jira(t *testing.T) {
+	ts := &kelosv1alpha1.TaskSpawner{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "spawner",
+			Namespace: "default",
+		},
+		Spec: kelosv1alpha1.TaskSpawnerSpec{
+			When: kelosv1alpha1.When{
+				Jira: &kelosv1alpha1.Jira{
+					BaseURL:   "https://mycompany.atlassian.net",
+					Project:   "PROJ",
+					JQL:       "status = Open",
+					SecretRef: kelosv1alpha1.SecretReference{Name: "jira-creds"},
+				},
+			},
+			TaskTemplate: kelosv1alpha1.TaskTemplate{
+				Type: "claude-code",
+				Credentials: kelosv1alpha1.Credentials{
+					Type:      kelosv1alpha1.CredentialTypeOAuth,
+					SecretRef: kelosv1alpha1.SecretReference{Name: "creds"},
+				},
+			},
+		},
+	}
+
+	t.Setenv("JIRA_USER", "user@example.com")
+	t.Setenv("JIRA_TOKEN", "jira-api-token")
+
+	src, err := buildSource(ts, "", "", "", "", "https://mycompany.atlassian.net", "PROJ", "status = Open", nil)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	jiraSrc, ok := src.(*source.JiraSource)
+	if !ok {
+		t.Fatalf("Expected *source.JiraSource, got %T", src)
+	}
+	if jiraSrc.BaseURL != "https://mycompany.atlassian.net" {
+		t.Errorf("BaseURL = %q, want %q", jiraSrc.BaseURL, "https://mycompany.atlassian.net")
+	}
+	if jiraSrc.Project != "PROJ" {
+		t.Errorf("Project = %q, want %q", jiraSrc.Project, "PROJ")
+	}
+	if jiraSrc.JQL != "status = Open" {
+		t.Errorf("JQL = %q, want %q", jiraSrc.JQL, "status = Open")
+	}
+	if jiraSrc.User != "user@example.com" {
+		t.Errorf("User = %q, want %q", jiraSrc.User, "user@example.com")
+	}
+	if jiraSrc.Token != "jira-api-token" {
+		t.Errorf("Token = %q, want %q", jiraSrc.Token, "jira-api-token")
+	}
+}
+
+func TestRunCycleWithSource_NoMaxConcurrency(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+	cl, key := setupTest(t, ts)
+
+	src := &fakeSource{
+		items: []source.WorkItem{
+			{ID: "1", Title: "Item 1"},
+			{ID: "2", Title: "Item 2"},
+			{ID: "3", Title: "Item 3"},
+		},
+	}
+
+	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// All 3 tasks should be created
+	var taskList kelosv1alpha1.TaskList
+	if err := cl.List(context.Background(), &taskList, client.InNamespace("default")); err != nil {
+		t.Fatalf("Listing tasks: %v", err)
+	}
+	if len(taskList.Items) != 3 {
+		t.Errorf("Expected 3 tasks, got %d", len(taskList.Items))
+	}
+}
+
+func TestRunCycleWithSource_MaxConcurrencyLimitsCreation(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", int32Ptr(2))
+	cl, key := setupTest(t, ts)
+
+	src := &fakeSource{
+		items: []source.WorkItem{
+			{ID: "1", Title: "Item 1"},
+			{ID: "2", Title: "Item 2"},
+			{ID: "3", Title: "Item 3"},
+			{ID: "4", Title: "Item 4"},
+		},
+	}
+
+	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// Only 2 tasks should be created (maxConcurrency=2)
+	var taskList kelosv1alpha1.TaskList
+	if err := cl.List(context.Background(), &taskList, client.InNamespace("default")); err != nil {
+		t.Fatalf("Listing tasks: %v", err)
+	}
+	if len(taskList.Items) != 2 {
+		t.Errorf("Expected 2 tasks (maxConcurrency=2), got %d", len(taskList.Items))
+	}
+}
+
+func TestRunCycleWithSource_MaxConcurrencyWithExistingActiveTasks(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", int32Ptr(3))
+	existingTasks := []kelosv1alpha1.Task{
+		newTask("spawner-existing1", "default", "spawner", kelosv1alpha1.TaskPhaseRunning),
+		newTask("spawner-existing2", "default", "spawner", kelosv1alpha1.TaskPhasePending),
+	}
+	cl, key := setupTest(t, ts, existingTasks...)
+
+	src := &fakeSource{
+		items: []source.WorkItem{
+			{ID: "existing1", Title: "Existing 1"},
+			{ID: "existing2", Title: "Existing 2"},
+			{ID: "3", Title: "Item 3"},
+			{ID: "4", Title: "Item 4"},
+			{ID: "5", Title: "Item 5"},
+		},
+	}
+
+	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// 2 active + 1 new = 3 (maxConcurrency), so only 1 new task should be created
+	var taskList kelosv1alpha1.TaskList
+	if err := cl.List(context.Background(), &taskList, client.InNamespace("default")); err != nil {
+		t.Fatalf("Listing tasks: %v", err)
+	}
+	if len(taskList.Items) != 3 {
+		t.Errorf("Expected 3 tasks (2 existing + 1 new), got %d", len(taskList.Items))
+	}
+}
+
+func TestRunCycleWithSource_CompletedTasksDontCountTowardsLimit(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", int32Ptr(2))
+	existingTasks := []kelosv1alpha1.Task{
+		newTask("spawner-done1", "default", "spawner", kelosv1alpha1.TaskPhaseSucceeded),
+		newTask("spawner-done2", "default", "spawner", kelosv1alpha1.TaskPhaseFailed),
+	}
+	cl, key := setupTest(t, ts, existingTasks...)
+
+	src := &fakeSource{
+		items: []source.WorkItem{
+			{ID: "done1", Title: "Done 1"},
+			{ID: "done2", Title: "Done 2"},
+			{ID: "3", Title: "Item 3"},
+			{ID: "4", Title: "Item 4"},
+			{ID: "5", Title: "Item 5"},
+		},
+	}
+
+	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// 2 completed tasks don't count, so 2 new can be created (maxConcurrency=2)
+	var taskList kelosv1alpha1.TaskList
+	if err := cl.List(context.Background(), &taskList, client.InNamespace("default")); err != nil {
+		t.Fatalf("Listing tasks: %v", err)
+	}
+	if len(taskList.Items) != 4 {
+		t.Errorf("Expected 4 tasks (2 completed + 2 new), got %d", len(taskList.Items))
+	}
+}
+
+func TestRunCycleWithSource_MaxConcurrencyZeroMeansNoLimit(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", int32Ptr(0))
+	cl, key := setupTest(t, ts)
+
+	src := &fakeSource{
+		items: []source.WorkItem{
+			{ID: "1", Title: "Item 1"},
+			{ID: "2", Title: "Item 2"},
+			{ID: "3", Title: "Item 3"},
+		},
+	}
+
+	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	var taskList kelosv1alpha1.TaskList
+	if err := cl.List(context.Background(), &taskList, client.InNamespace("default")); err != nil {
+		t.Fatalf("Listing tasks: %v", err)
+	}
+	if len(taskList.Items) != 3 {
+		t.Errorf("Expected 3 tasks (no limit with maxConcurrency=0), got %d", len(taskList.Items))
+	}
+}
+
+func TestRunCycleWithSource_MaxConcurrencyAlreadyAtLimit(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", int32Ptr(2))
+	existingTasks := []kelosv1alpha1.Task{
+		newTask("spawner-active1", "default", "spawner", kelosv1alpha1.TaskPhaseRunning),
+		newTask("spawner-active2", "default", "spawner", kelosv1alpha1.TaskPhasePending),
+	}
+	cl, key := setupTest(t, ts, existingTasks...)
+
+	src := &fakeSource{
+		items: []source.WorkItem{
+			{ID: "active1", Title: "Active 1"},
+			{ID: "active2", Title: "Active 2"},
+			{ID: "3", Title: "New Item"},
+		},
+	}
+
+	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// Already at limit (2 active), so no new tasks should be created
+	var taskList kelosv1alpha1.TaskList
+	if err := cl.List(context.Background(), &taskList, client.InNamespace("default")); err != nil {
+		t.Fatalf("Listing tasks: %v", err)
+	}
+	if len(taskList.Items) != 2 {
+		t.Errorf("Expected 2 tasks (at limit, none created), got %d", len(taskList.Items))
+	}
+}
+
+func TestRunCycleWithSource_ActiveTasksStatusUpdated(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", int32Ptr(5))
+	existingTasks := []kelosv1alpha1.Task{
+		newTask("spawner-running", "default", "spawner", kelosv1alpha1.TaskPhaseRunning),
+		newTask("spawner-done", "default", "spawner", kelosv1alpha1.TaskPhaseSucceeded),
+	}
+	cl, key := setupTest(t, ts, existingTasks...)
+
+	src := &fakeSource{
+		items: []source.WorkItem{
+			{ID: "running", Title: "Running"},
+			{ID: "done", Title: "Done"},
+			{ID: "3", Title: "New"},
+		},
+	}
+
+	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// Check status was updated with activeTasks
+	var updatedTS kelosv1alpha1.TaskSpawner
+	if err := cl.Get(context.Background(), key, &updatedTS); err != nil {
+		t.Fatalf("Getting TaskSpawner: %v", err)
+	}
+	// 1 existing running + 1 new = 2 active
+	if updatedTS.Status.ActiveTasks != 2 {
+		t.Errorf("Expected activeTasks=2, got %d", updatedTS.Status.ActiveTasks)
+	}
+}
+
+func int64Ptr(v int64) *int64 { return &v }
+
+func TestRunCycleWithSource_AgentConfigRefForwarded(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+	ts.Spec.TaskTemplate.AgentConfigRef = &kelosv1alpha1.AgentConfigReference{
+		Name: "my-config",
+	}
+	cl, key := setupTest(t, ts)
+
+	src := &fakeSource{
+		items: []source.WorkItem{
+			{ID: "1", Title: "Item 1"},
+		},
+	}
+
+	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	var taskList kelosv1alpha1.TaskList
+	if err := cl.List(context.Background(), &taskList, client.InNamespace("default")); err != nil {
+		t.Fatalf("Listing tasks: %v", err)
+	}
+	if len(taskList.Items) != 1 {
+		t.Fatalf("Expected 1 task, got %d", len(taskList.Items))
+	}
+
+	task := taskList.Items[0]
+	if task.Spec.AgentConfigRef == nil {
+		t.Fatal("Expected AgentConfigRef to be forwarded to spawned Task")
+	}
+	if task.Spec.AgentConfigRef.Name != "my-config" {
+		t.Errorf("Expected AgentConfigRef.Name %q, got %q", "my-config", task.Spec.AgentConfigRef.Name)
+	}
+}
+
+func TestRunCycleWithSource_PodOverridesForwarded(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+	ts.Spec.TaskTemplate.PodOverrides = &kelosv1alpha1.PodOverrides{
+		ActiveDeadlineSeconds: int64Ptr(1800),
+		Env: []corev1.EnvVar{
+			{Name: "HTTP_PROXY", Value: "http://proxy:8080"},
+		},
+		NodeSelector: map[string]string{
+			"pool": "agents",
+		},
+	}
+	cl, key := setupTest(t, ts)
+
+	src := &fakeSource{
+		items: []source.WorkItem{
+			{ID: "1", Title: "Item 1"},
+		},
+	}
+
+	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// Verify the created Task has PodOverrides forwarded from the TaskTemplate.
+	var taskList kelosv1alpha1.TaskList
+	if err := cl.List(context.Background(), &taskList, client.InNamespace("default")); err != nil {
+		t.Fatalf("Listing tasks: %v", err)
+	}
+	if len(taskList.Items) != 1 {
+		t.Fatalf("Expected 1 task, got %d", len(taskList.Items))
+	}
+
+	task := taskList.Items[0]
+	if task.Spec.PodOverrides == nil {
+		t.Fatal("Expected PodOverrides to be forwarded to spawned Task")
+	}
+	if task.Spec.PodOverrides.ActiveDeadlineSeconds == nil || *task.Spec.PodOverrides.ActiveDeadlineSeconds != 1800 {
+		t.Errorf("Expected ActiveDeadlineSeconds 1800, got %v", task.Spec.PodOverrides.ActiveDeadlineSeconds)
+	}
+	if len(task.Spec.PodOverrides.Env) != 1 || task.Spec.PodOverrides.Env[0].Name != "HTTP_PROXY" {
+		t.Errorf("Expected env HTTP_PROXY to be forwarded, got %v", task.Spec.PodOverrides.Env)
+	}
+	if task.Spec.PodOverrides.NodeSelector["pool"] != "agents" {
+		t.Errorf("Expected nodeSelector pool=agents, got %v", task.Spec.PodOverrides.NodeSelector)
+	}
+}
+
+func TestRunCycleWithSource_Suspended(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+	ts.Spec.Suspend = boolPtr(true)
+	cl, key := setupTest(t, ts)
+
+	src := &fakeSource{
+		items: []source.WorkItem{
+			{ID: "1", Title: "Item 1"},
+			{ID: "2", Title: "Item 2"},
+		},
+	}
+
+	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// No tasks should be created when suspended
+	var taskList kelosv1alpha1.TaskList
+	if err := cl.List(context.Background(), &taskList, client.InNamespace("default")); err != nil {
+		t.Fatalf("Listing tasks: %v", err)
+	}
+	if len(taskList.Items) != 0 {
+		t.Errorf("Expected 0 tasks when suspended, got %d", len(taskList.Items))
+	}
+
+	// Status should be Suspended
+	var updatedTS kelosv1alpha1.TaskSpawner
+	if err := cl.Get(context.Background(), key, &updatedTS); err != nil {
+		t.Fatalf("Getting TaskSpawner: %v", err)
+	}
+	if updatedTS.Status.Phase != kelosv1alpha1.TaskSpawnerPhaseSuspended {
+		t.Errorf("Expected phase %q, got %q", kelosv1alpha1.TaskSpawnerPhaseSuspended, updatedTS.Status.Phase)
+	}
+	if updatedTS.Status.Message != "Suspended by user" {
+		t.Errorf("Expected message %q, got %q", "Suspended by user", updatedTS.Status.Message)
+	}
+}
+
+func TestRunCycleWithSource_SuspendFalseRunsNormally(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+	ts.Spec.Suspend = boolPtr(false)
+	cl, key := setupTest(t, ts)
+
+	src := &fakeSource{
+		items: []source.WorkItem{
+			{ID: "1", Title: "Item 1"},
+			{ID: "2", Title: "Item 2"},
+		},
+	}
+
+	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// Tasks should be created normally when suspend=false
+	var taskList kelosv1alpha1.TaskList
+	if err := cl.List(context.Background(), &taskList, client.InNamespace("default")); err != nil {
+		t.Fatalf("Listing tasks: %v", err)
+	}
+	if len(taskList.Items) != 2 {
+		t.Errorf("Expected 2 tasks when suspend=false, got %d", len(taskList.Items))
+	}
+}
+
+func TestRunCycleWithSource_SuspendedIdempotent(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+	ts.Spec.Suspend = boolPtr(true)
+	// Pre-set the status to Suspended to test idempotency
+	ts.Status.Phase = kelosv1alpha1.TaskSpawnerPhaseSuspended
+	ts.Status.Message = "Suspended by user"
+	cl, key := setupTest(t, ts)
+
+	src := &fakeSource{
+		items: []source.WorkItem{
+			{ID: "1", Title: "Item 1"},
+		},
+	}
+
+	// Run twice - should not error on the second run
+	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
+		t.Fatalf("First cycle error: %v", err)
+	}
+	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
+		t.Fatalf("Second cycle error: %v", err)
+	}
+
+	// Still no tasks created
+	var taskList kelosv1alpha1.TaskList
+	if err := cl.List(context.Background(), &taskList, client.InNamespace("default")); err != nil {
+		t.Fatalf("Listing tasks: %v", err)
+	}
+	if len(taskList.Items) != 0 {
+		t.Errorf("Expected 0 tasks when suspended, got %d", len(taskList.Items))
+	}
+}
+
+func TestRunCycleWithSource_MaxTotalTasksLimitsCreation(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+	ts.Spec.MaxTotalTasks = int32Ptr(2)
+	cl, key := setupTest(t, ts)
+
+	src := &fakeSource{
+		items: []source.WorkItem{
+			{ID: "1", Title: "Item 1"},
+			{ID: "2", Title: "Item 2"},
+			{ID: "3", Title: "Item 3"},
+			{ID: "4", Title: "Item 4"},
+		},
+	}
+
+	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// Only 2 tasks should be created (maxTotalTasks=2)
+	var taskList kelosv1alpha1.TaskList
+	if err := cl.List(context.Background(), &taskList, client.InNamespace("default")); err != nil {
+		t.Fatalf("Listing tasks: %v", err)
+	}
+	if len(taskList.Items) != 2 {
+		t.Errorf("Expected 2 tasks (maxTotalTasks=2), got %d", len(taskList.Items))
+	}
+
+	// Check TaskBudgetExhausted condition
+	var updatedTS kelosv1alpha1.TaskSpawner
+	if err := cl.Get(context.Background(), key, &updatedTS); err != nil {
+		t.Fatalf("Getting TaskSpawner: %v", err)
+	}
+	foundCondition := false
+	for _, c := range updatedTS.Status.Conditions {
+		if c.Type == "TaskBudgetExhausted" && c.Status == metav1.ConditionTrue {
+			foundCondition = true
+			break
+		}
+	}
+	if !foundCondition {
+		t.Error("Expected TaskBudgetExhausted condition to be True")
+	}
+}
+
+func TestRunCycleWithSource_MaxTotalTasksWithExistingTasks(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+	ts.Spec.MaxTotalTasks = int32Ptr(3)
+	ts.Status.TotalTasksCreated = 2 // Already created 2 tasks before
+	existingTasks := []kelosv1alpha1.Task{
+		newTask("spawner-existing1", "default", "spawner", kelosv1alpha1.TaskPhaseSucceeded),
+		newTask("spawner-existing2", "default", "spawner", kelosv1alpha1.TaskPhaseRunning),
+	}
+	cl, key := setupTest(t, ts, existingTasks...)
+
+	src := &fakeSource{
+		items: []source.WorkItem{
+			{ID: "existing1", Title: "Existing 1"},
+			{ID: "existing2", Title: "Existing 2"},
+			{ID: "3", Title: "Item 3"},
+			{ID: "4", Title: "Item 4"},
+			{ID: "5", Title: "Item 5"},
+		},
+	}
+
+	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// Only 1 new task should be created (totalCreated=2, max=3, budget left=1)
+	var taskList kelosv1alpha1.TaskList
+	if err := cl.List(context.Background(), &taskList, client.InNamespace("default")); err != nil {
+		t.Fatalf("Listing tasks: %v", err)
+	}
+	if len(taskList.Items) != 3 {
+		t.Errorf("Expected 3 tasks (2 existing + 1 new), got %d", len(taskList.Items))
+	}
+}
+
+func TestRunCycleWithSource_MaxTotalTasksBudgetAlreadyExhausted(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+	ts.Spec.MaxTotalTasks = int32Ptr(5)
+	ts.Status.TotalTasksCreated = 5 // Budget already used
+	cl, key := setupTest(t, ts)
+
+	src := &fakeSource{
+		items: []source.WorkItem{
+			{ID: "1", Title: "Item 1"},
+			{ID: "2", Title: "Item 2"},
+		},
+	}
+
+	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// No new tasks should be created
+	var taskList kelosv1alpha1.TaskList
+	if err := cl.List(context.Background(), &taskList, client.InNamespace("default")); err != nil {
+		t.Fatalf("Listing tasks: %v", err)
+	}
+	if len(taskList.Items) != 0 {
+		t.Errorf("Expected 0 tasks (budget exhausted), got %d", len(taskList.Items))
+	}
+}
+
+func TestRunCycleWithSource_MaxTotalTasksZeroMeansNoLimit(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+	ts.Spec.MaxTotalTasks = int32Ptr(0)
+	cl, key := setupTest(t, ts)
+
+	src := &fakeSource{
+		items: []source.WorkItem{
+			{ID: "1", Title: "Item 1"},
+			{ID: "2", Title: "Item 2"},
+			{ID: "3", Title: "Item 3"},
+		},
+	}
+
+	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	var taskList kelosv1alpha1.TaskList
+	if err := cl.List(context.Background(), &taskList, client.InNamespace("default")); err != nil {
+		t.Fatalf("Listing tasks: %v", err)
+	}
+	if len(taskList.Items) != 3 {
+		t.Errorf("Expected 3 tasks (no limit with maxTotalTasks=0), got %d", len(taskList.Items))
+	}
+}
+
+func TestRunCycleWithSource_MaxTotalTasksAndMaxConcurrencyCombined(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", int32Ptr(10))
+	ts.Spec.MaxTotalTasks = int32Ptr(2)
+	cl, key := setupTest(t, ts)
+
+	src := &fakeSource{
+		items: []source.WorkItem{
+			{ID: "1", Title: "Item 1"},
+			{ID: "2", Title: "Item 2"},
+			{ID: "3", Title: "Item 3"},
+			{ID: "4", Title: "Item 4"},
+		},
+	}
+
+	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// maxTotalTasks=2 is more restrictive than maxConcurrency=10
+	var taskList kelosv1alpha1.TaskList
+	if err := cl.List(context.Background(), &taskList, client.InNamespace("default")); err != nil {
+		t.Fatalf("Listing tasks: %v", err)
+	}
+	if len(taskList.Items) != 2 {
+		t.Errorf("Expected 2 tasks (maxTotalTasks=2 more restrictive), got %d", len(taskList.Items))
+	}
+}
+
+func TestRunCycleWithSource_SuspendedConditionSet(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+	ts.Spec.Suspend = boolPtr(true)
+	cl, key := setupTest(t, ts)
+
+	src := &fakeSource{
+		items: []source.WorkItem{
+			{ID: "1", Title: "Item 1"},
+		},
+	}
+
+	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	var updatedTS kelosv1alpha1.TaskSpawner
+	if err := cl.Get(context.Background(), key, &updatedTS); err != nil {
+		t.Fatalf("Getting TaskSpawner: %v", err)
+	}
+
+	foundSuspended := false
+	for _, c := range updatedTS.Status.Conditions {
+		if c.Type == "Suspended" && c.Status == metav1.ConditionTrue {
+			foundSuspended = true
+			break
+		}
+	}
+	if !foundSuspended {
+		t.Error("Expected Suspended condition to be True")
+	}
+}
+
+func TestRunCycleWithSource_BranchTemplateRendered(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+	ts.Spec.TaskTemplate.Branch = "kelos-task-{{.Number}}"
+	cl, key := setupTest(t, ts)
+
+	src := &fakeSource{
+		items: []source.WorkItem{
+			{ID: "42", Number: 42, Title: "Fix login bug"},
+			{ID: "99", Number: 99, Title: "Add feature"},
+		},
+	}
+
+	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	var taskList kelosv1alpha1.TaskList
+	if err := cl.List(context.Background(), &taskList, client.InNamespace("default")); err != nil {
+		t.Fatalf("Listing tasks: %v", err)
+	}
+	if len(taskList.Items) != 2 {
+		t.Fatalf("Expected 2 tasks, got %d", len(taskList.Items))
+	}
+
+	branches := make(map[string]string)
+	for _, task := range taskList.Items {
+		branches[task.Name] = task.Spec.Branch
+	}
+	if branches["spawner-42"] != "kelos-task-42" {
+		t.Errorf("Expected branch %q for spawner-42, got %q", "kelos-task-42", branches["spawner-42"])
+	}
+	if branches["spawner-99"] != "kelos-task-99" {
+		t.Errorf("Expected branch %q for spawner-99, got %q", "kelos-task-99", branches["spawner-99"])
+	}
+}
+
+func TestRunCycleWithSource_BranchStaticPassedThrough(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+	ts.Spec.TaskTemplate.Branch = "feature/my-branch"
+	cl, key := setupTest(t, ts)
+
+	src := &fakeSource{
+		items: []source.WorkItem{
+			{ID: "1", Number: 1, Title: "Item 1"},
+		},
+	}
+
+	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	var taskList kelosv1alpha1.TaskList
+	if err := cl.List(context.Background(), &taskList, client.InNamespace("default")); err != nil {
+		t.Fatalf("Listing tasks: %v", err)
+	}
+	if len(taskList.Items) != 1 {
+		t.Fatalf("Expected 1 task, got %d", len(taskList.Items))
+	}
+	if taskList.Items[0].Spec.Branch != "feature/my-branch" {
+		t.Errorf("Expected branch %q, got %q", "feature/my-branch", taskList.Items[0].Spec.Branch)
+	}
+}
+
+func TestRunCycleWithSource_NotSuspendedConditionCleared(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+	ts.Spec.Suspend = boolPtr(false)
+	cl, key := setupTest(t, ts)
+
+	src := &fakeSource{
+		items: []source.WorkItem{
+			{ID: "1", Title: "Item 1"},
+		},
+	}
+
+	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	var updatedTS kelosv1alpha1.TaskSpawner
+	if err := cl.Get(context.Background(), key, &updatedTS); err != nil {
+		t.Fatalf("Getting TaskSpawner: %v", err)
+	}
+
+	for _, c := range updatedTS.Status.Conditions {
+		if c.Type == "Suspended" && c.Status == metav1.ConditionTrue {
+			t.Error("Expected Suspended condition to be False when not suspended")
+		}
+	}
+}
+
+func TestRunCycleWithSource_PriorityLabelsOrderCreation(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", int32Ptr(2))
+	ts.Spec.When.GitHubIssues.PriorityLabels = []string{
+		"priority/critical-urgent",
+		"priority/imporant-soon",
+		"priority/backlog",
+	}
+	cl, key := setupTest(t, ts)
+
+	// Items arrive in reverse priority order (simulating GitHub API default sort)
+	src := &fakeSource{
+		items: []source.WorkItem{
+			{ID: "3", Title: "Backlog item", Labels: []string{"priority/backlog"}},
+			{ID: "2", Title: "Important item", Labels: []string{"priority/imporant-soon"}},
+			{ID: "1", Title: "Critical item", Labels: []string{"priority/critical-urgent"}},
+		},
+	}
+
+	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// With maxConcurrency=2, only 2 tasks should be created
+	var taskList kelosv1alpha1.TaskList
+	if err := cl.List(context.Background(), &taskList, client.InNamespace("default")); err != nil {
+		t.Fatalf("Listing tasks: %v", err)
+	}
+	if len(taskList.Items) != 2 {
+		t.Fatalf("Expected 2 tasks, got %d", len(taskList.Items))
+	}
+
+	// The critical and important items should be created (not backlog)
+	created := make(map[string]bool)
+	for _, task := range taskList.Items {
+		created[task.Name] = true
+	}
+	if !created["spawner-1"] {
+		t.Error("Expected critical-urgent task (spawner-1) to be created")
+	}
+	if !created["spawner-2"] {
+		t.Error("Expected imporant-soon task (spawner-2) to be created")
+	}
+	if created["spawner-3"] {
+		t.Error("Backlog task (spawner-3) should NOT have been created")
+	}
+}
+
+func TestRunCycleWithSource_PriorityLabelsNotConfigured(t *testing.T) {
+	// When priorityLabels is not configured, items should be processed in discovery order
+	ts := newTaskSpawner("spawner", "default", int32Ptr(2))
+	cl, key := setupTest(t, ts)
+
+	src := &fakeSource{
+		items: []source.WorkItem{
+			{ID: "3", Title: "Backlog item", Labels: []string{"priority/backlog"}},
+			{ID: "2", Title: "Important item", Labels: []string{"priority/imporant-soon"}},
+			{ID: "1", Title: "Critical item", Labels: []string{"priority/critical-urgent"}},
+		},
+	}
+
+	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	var taskList kelosv1alpha1.TaskList
+	if err := cl.List(context.Background(), &taskList, client.InNamespace("default")); err != nil {
+		t.Fatalf("Listing tasks: %v", err)
+	}
+	if len(taskList.Items) != 2 {
+		t.Fatalf("Expected 2 tasks, got %d", len(taskList.Items))
+	}
+
+	// Without priority labels, tasks should be created in discovery order (ID 3, 2)
+	created := make(map[string]bool)
+	for _, task := range taskList.Items {
+		created[task.Name] = true
+	}
+	if !created["spawner-3"] {
+		t.Error("Expected spawner-3 to be created (discovery order)")
+	}
+	if !created["spawner-2"] {
+		t.Error("Expected spawner-2 to be created (discovery order)")
+	}
+}
+
+func TestBuildSource_PriorityLabelsPassedToSource(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+	ts.Spec.When.GitHubIssues.PriorityLabels = []string{
+		"priority/critical-urgent",
+		"priority/imporant-soon",
+	}
+
+	src, err := buildSource(ts, "owner", "repo", "", "", "", "", "", nil)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	ghSrc, ok := src.(*source.GitHubSource)
+	if !ok {
+		t.Fatalf("Expected *source.GitHubSource, got %T", src)
+	}
+	if len(ghSrc.PriorityLabels) != 2 {
+		t.Fatalf("Expected 2 priority labels, got %d", len(ghSrc.PriorityLabels))
+	}
+	if ghSrc.PriorityLabels[0] != "priority/critical-urgent" {
+		t.Errorf("PriorityLabels[0] = %q, want %q", ghSrc.PriorityLabels[0], "priority/critical-urgent")
+	}
+	if ghSrc.PriorityLabels[1] != "priority/imporant-soon" {
+		t.Errorf("PriorityLabels[1] = %q, want %q", ghSrc.PriorityLabels[1], "priority/imporant-soon")
+	}
+}
+
+func TestRunCycleWithSource_CommentFieldsPassedToSource(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+	ts.Spec.When.GitHubIssues = &kelosv1alpha1.GitHubIssues{
+		TriggerComment:  "/kelos pick-up",
+		ExcludeComments: []string{"/kelos needs-input"},
+	}
+
+	src, err := buildSource(ts, "owner", "repo", "", "", "", "", "", nil)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	ghSrc, ok := src.(*source.GitHubSource)
+	if !ok {
+		t.Fatalf("Expected *source.GitHubSource, got %T", src)
+	}
+	if ghSrc.TriggerComment != "/kelos pick-up" {
+		t.Errorf("TriggerComment = %q, want %q", ghSrc.TriggerComment, "/kelos pick-up")
+	}
+	if len(ghSrc.ExcludeComments) != 1 || ghSrc.ExcludeComments[0] != "/kelos needs-input" {
+		t.Errorf("ExcludeComments = %v, want %v", ghSrc.ExcludeComments, []string{"/kelos needs-input"})
+	}
+}
+
+func TestBuildSource_CommentPolicyPassedToIssueSource(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+	ts.Spec.When.GitHubIssues = &kelosv1alpha1.GitHubIssues{
+		CommentPolicy: &kelosv1alpha1.GitHubCommentPolicy{
+			TriggerComment:    "/kelos pick-up",
+			ExcludeComments:   []string{"/kelos needs-input"},
+			AllowedUsers:      []string{"alice"},
+			AllowedTeams:      []kelosv1alpha1.GitHubTeamRef{"my-org/platform"},
+			MinimumPermission: "write",
+		},
+	}
+
+	src, err := buildSource(ts, "owner", "repo", "", "", "", "", "", nil)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	ghSrc, ok := src.(*source.GitHubSource)
+	if !ok {
+		t.Fatalf("Expected *source.GitHubSource, got %T", src)
+	}
+	if ghSrc.TriggerComment != "/kelos pick-up" {
+		t.Errorf("TriggerComment = %q, want %q", ghSrc.TriggerComment, "/kelos pick-up")
+	}
+	if len(ghSrc.ExcludeComments) != 1 || ghSrc.ExcludeComments[0] != "/kelos needs-input" {
+		t.Errorf("ExcludeComments = %v, want %v", ghSrc.ExcludeComments, []string{"/kelos needs-input"})
+	}
+	if len(ghSrc.AllowedUsers) != 1 || ghSrc.AllowedUsers[0] != "alice" {
+		t.Errorf("AllowedUsers = %v, want %v", ghSrc.AllowedUsers, []string{"alice"})
+	}
+	if len(ghSrc.AllowedTeams) != 1 || ghSrc.AllowedTeams[0] != "my-org/platform" {
+		t.Errorf("AllowedTeams = %v, want %v", ghSrc.AllowedTeams, []string{"my-org/platform"})
+	}
+	if ghSrc.MinimumPermission != "write" {
+		t.Errorf("MinimumPermission = %q, want %q", ghSrc.MinimumPermission, "write")
+	}
+}
+
+func TestBuildSource_CommentPolicyPassedToPullRequestSource(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+	ts.Spec.When = kelosv1alpha1.When{
+		GitHubPullRequests: &kelosv1alpha1.GitHubPullRequests{
+			CommentPolicy: &kelosv1alpha1.GitHubCommentPolicy{
+				TriggerComment:    "/kelos pick-up",
+				ExcludeComments:   []string{"/kelos needs-input"},
+				AllowedUsers:      []string{"alice"},
+				AllowedTeams:      []kelosv1alpha1.GitHubTeamRef{"my-org/platform"},
+				MinimumPermission: "maintain",
+			},
+		},
+	}
+
+	src, err := buildSource(ts, "owner", "repo", "", "", "", "", "", nil)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	ghSrc, ok := src.(*source.GitHubPullRequestSource)
+	if !ok {
+		t.Fatalf("Expected *source.GitHubPullRequestSource, got %T", src)
+	}
+	if ghSrc.TriggerComment != "/kelos pick-up" {
+		t.Errorf("TriggerComment = %q, want %q", ghSrc.TriggerComment, "/kelos pick-up")
+	}
+	if len(ghSrc.ExcludeComments) != 1 || ghSrc.ExcludeComments[0] != "/kelos needs-input" {
+		t.Errorf("ExcludeComments = %v, want %v", ghSrc.ExcludeComments, []string{"/kelos needs-input"})
+	}
+	if len(ghSrc.AllowedUsers) != 1 || ghSrc.AllowedUsers[0] != "alice" {
+		t.Errorf("AllowedUsers = %v, want %v", ghSrc.AllowedUsers, []string{"alice"})
+	}
+	if len(ghSrc.AllowedTeams) != 1 || ghSrc.AllowedTeams[0] != "my-org/platform" {
+		t.Errorf("AllowedTeams = %v, want %v", ghSrc.AllowedTeams, []string{"my-org/platform"})
+	}
+	if ghSrc.MinimumPermission != "maintain" {
+		t.Errorf("MinimumPermission = %q, want %q", ghSrc.MinimumPermission, "maintain")
+	}
+}
+
+func TestBuildSource_CommentPolicyRejectsMixedConfig(t *testing.T) {
+	tests := []struct {
+		name string
+		ts   *kelosv1alpha1.TaskSpawner
+	}{
+		{
+			name: "issues",
+			ts: &kelosv1alpha1.TaskSpawner{
+				Spec: kelosv1alpha1.TaskSpawnerSpec{
+					When: kelosv1alpha1.When{
+						GitHubIssues: &kelosv1alpha1.GitHubIssues{
+							TriggerComment: "/kelos pick-up",
+							CommentPolicy: &kelosv1alpha1.GitHubCommentPolicy{
+								AllowedUsers: []string{"alice"},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "pull requests",
+			ts: &kelosv1alpha1.TaskSpawner{
+				Spec: kelosv1alpha1.TaskSpawnerSpec{
+					When: kelosv1alpha1.When{
+						GitHubPullRequests: &kelosv1alpha1.GitHubPullRequests{
+							ExcludeComments: []string{"/kelos needs-input"},
+							CommentPolicy: &kelosv1alpha1.GitHubCommentPolicy{
+								AllowedUsers: []string{"alice"},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := buildSource(tt.ts, "owner", "repo", "", "", "", "", "", nil)
+			if err == nil {
+				t.Fatal("Expected error for mixed legacy and commentPolicy config")
+			}
+		})
+	}
+}
+
+func newCompletedTask(name, namespace, spawnerName string, phase kelosv1alpha1.TaskPhase, completionTime time.Time) kelosv1alpha1.Task {
+	ct := metav1.NewTime(completionTime)
+	return kelosv1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels: map[string]string{
+				"kelos.dev/taskspawner": spawnerName,
+			},
+		},
+		Spec: kelosv1alpha1.TaskSpec{
+			Type:   "claude-code",
+			Prompt: "test",
+			Credentials: kelosv1alpha1.Credentials{
+				Type:      kelosv1alpha1.CredentialTypeOAuth,
+				SecretRef: kelosv1alpha1.SecretReference{Name: "creds"},
+			},
+		},
+		Status: kelosv1alpha1.TaskStatus{
+			Phase:          phase,
+			CompletionTime: &ct,
+		},
+	}
+}
+
+func TestRunCycleWithSource_RetriggerCompletedTask(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+	ts.Spec.When.GitHubIssues.TriggerComment = "/kelos pick-up"
+
+	completionTime := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	triggerTime := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC) // after completion
+
+	existingTasks := []kelosv1alpha1.Task{
+		newCompletedTask("spawner-1", "default", "spawner", kelosv1alpha1.TaskPhaseSucceeded, completionTime),
+	}
+	cl, key := setupTest(t, ts, existingTasks...)
+
+	src := &fakeSource{
+		items: []source.WorkItem{
+			{ID: "1", Title: "Retriggered item", TriggerTime: triggerTime},
+		},
+	}
+
+	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// The old completed task should be deleted and a new one created
+	var taskList kelosv1alpha1.TaskList
+	if err := cl.List(context.Background(), &taskList, client.InNamespace("default")); err != nil {
+		t.Fatalf("Listing tasks: %v", err)
+	}
+	if len(taskList.Items) != 1 {
+		t.Fatalf("Expected 1 task (old deleted, new created), got %d", len(taskList.Items))
+	}
+	// The new task should not have a completion time (it's freshly created)
+	if taskList.Items[0].Status.CompletionTime != nil {
+		t.Error("Expected new task to have no CompletionTime")
+	}
+}
+
+func TestRunCycleWithSource_RetriggerSkippedWhenTriggerBeforeCompletion(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+	ts.Spec.When.GitHubIssues.TriggerComment = "/kelos pick-up"
+
+	completionTime := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
+	triggerTime := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC) // before completion
+
+	existingTasks := []kelosv1alpha1.Task{
+		newCompletedTask("spawner-1", "default", "spawner", kelosv1alpha1.TaskPhaseSucceeded, completionTime),
+	}
+	cl, key := setupTest(t, ts, existingTasks...)
+
+	src := &fakeSource{
+		items: []source.WorkItem{
+			{ID: "1", Title: "Old trigger", TriggerTime: triggerTime},
+		},
+	}
+
+	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// The completed task should remain and no new task should be created
+	var taskList kelosv1alpha1.TaskList
+	if err := cl.List(context.Background(), &taskList, client.InNamespace("default")); err != nil {
+		t.Fatalf("Listing tasks: %v", err)
+	}
+	if len(taskList.Items) != 1 {
+		t.Fatalf("Expected 1 task (no retrigger), got %d", len(taskList.Items))
+	}
+	if taskList.Items[0].Status.CompletionTime == nil {
+		t.Error("Expected the original completed task to remain")
+	}
+}
+
+func TestRunCycleWithSource_RetriggerFailedTask(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+	ts.Spec.When.GitHubIssues.TriggerComment = "/kelos pick-up"
+
+	completionTime := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	triggerTime := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC) // after completion
+
+	existingTasks := []kelosv1alpha1.Task{
+		newCompletedTask("spawner-1", "default", "spawner", kelosv1alpha1.TaskPhaseFailed, completionTime),
+	}
+	cl, key := setupTest(t, ts, existingTasks...)
+
+	src := &fakeSource{
+		items: []source.WorkItem{
+			{ID: "1", Title: "Retriggered after failure", TriggerTime: triggerTime},
+		},
+	}
+
+	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// The failed task should be deleted and a new one created
+	var taskList kelosv1alpha1.TaskList
+	if err := cl.List(context.Background(), &taskList, client.InNamespace("default")); err != nil {
+		t.Fatalf("Listing tasks: %v", err)
+	}
+	if len(taskList.Items) != 1 {
+		t.Fatalf("Expected 1 task (old deleted, new created), got %d", len(taskList.Items))
+	}
+	if taskList.Items[0].Status.CompletionTime != nil {
+		t.Error("Expected new task to have no CompletionTime")
+	}
+}
+
+func TestRunCycleWithSource_RetriggerFromSourceTriggerTime(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+
+	completionTime := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	triggerTime := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
+
+	existingTasks := []kelosv1alpha1.Task{
+		newCompletedTask("spawner-1", "default", "spawner", kelosv1alpha1.TaskPhaseSucceeded, completionTime),
+	}
+	cl, key := setupTest(t, ts, existingTasks...)
+
+	src := &fakeSource{
+		items: []source.WorkItem{
+			{ID: "1", Title: "Item with trigger time but no config", TriggerTime: triggerTime},
+		},
+	}
+
+	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// The old completed task should be deleted and a new one created.
+	var taskList kelosv1alpha1.TaskList
+	if err := cl.List(context.Background(), &taskList, client.InNamespace("default")); err != nil {
+		t.Fatalf("Listing tasks: %v", err)
+	}
+	if len(taskList.Items) != 1 {
+		t.Fatalf("Expected 1 task (old deleted, new created), got %d", len(taskList.Items))
+	}
+	if taskList.Items[0].Status.CompletionTime != nil {
+		t.Error("Expected a fresh task without CompletionTime")
+	}
+}
+
+func TestRunCycleWithSource_RetriggerSkippedForRunningTask(t *testing.T) {
+	// Active (running) tasks should never be retriggered
+	ts := newTaskSpawner("spawner", "default", nil)
+	ts.Spec.When.GitHubIssues.TriggerComment = "/kelos pick-up"
+
+	existingTasks := []kelosv1alpha1.Task{
+		newTask("spawner-1", "default", "spawner", kelosv1alpha1.TaskPhaseRunning),
+	}
+	cl, key := setupTest(t, ts, existingTasks...)
+
+	src := &fakeSource{
+		items: []source.WorkItem{
+			{ID: "1", Title: "Item", TriggerTime: time.Now()},
+		},
+	}
+
+	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// Running task should remain and no new task should be created
+	var taskList kelosv1alpha1.TaskList
+	if err := cl.List(context.Background(), &taskList, client.InNamespace("default")); err != nil {
+		t.Fatalf("Listing tasks: %v", err)
+	}
+	if len(taskList.Items) != 1 {
+		t.Fatalf("Expected 1 task (no retrigger for running), got %d", len(taskList.Items))
+	}
+}
+
+func TestRunCycleWithSource_RetriggerRespectsMaxConcurrency(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", int32Ptr(1))
+	ts.Spec.When.GitHubIssues.TriggerComment = "/kelos pick-up"
+
+	completionTime := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	triggerTime := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
+
+	// One running task already at the concurrency limit, plus one completed task to retrigger
+	existingTasks := []kelosv1alpha1.Task{
+		newTask("spawner-running", "default", "spawner", kelosv1alpha1.TaskPhaseRunning),
+		newCompletedTask("spawner-1", "default", "spawner", kelosv1alpha1.TaskPhaseSucceeded, completionTime),
+	}
+	cl, key := setupTest(t, ts, existingTasks...)
+
+	src := &fakeSource{
+		items: []source.WorkItem{
+			{ID: "running", Title: "Running"},
+			{ID: "1", Title: "Retriggered", TriggerTime: triggerTime},
+		},
+	}
+
+	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// The completed task should be deleted (retrigger), but the new task
+	// should not be created because maxConcurrency=1 is already reached
+	// by the running task.
+	var taskList kelosv1alpha1.TaskList
+	if err := cl.List(context.Background(), &taskList, client.InNamespace("default")); err != nil {
+		t.Fatalf("Listing tasks: %v", err)
+	}
+
+	// The completed task was deleted during the retrigger phase, but the new
+	// task was not created because maxConcurrency=1 is already filled by the
+	// running task. The item will be picked up as new on the next cycle.
+	if len(taskList.Items) != 1 {
+		t.Fatalf("Expected 1 task (running only, retrigger blocked by concurrency), got %d", len(taskList.Items))
+	}
+	if taskList.Items[0].Name != "spawner-running" {
+		t.Errorf("Expected spawner-running to remain, got %q", taskList.Items[0].Name)
+	}
+}
+
+func TestDeriveUpstreamRepo(t *testing.T) {
+	tests := []struct {
+		name string
+		ts   *kelosv1alpha1.TaskSpawner
+		want string
+	}{
+		{
+			name: "GitHubIssues with shorthand",
+			ts: &kelosv1alpha1.TaskSpawner{
+				Spec: kelosv1alpha1.TaskSpawnerSpec{
+					When: kelosv1alpha1.When{
+						GitHubIssues: &kelosv1alpha1.GitHubIssues{
+							Repo: "upstream-org/upstream-repo",
+						},
+					},
+				},
+			},
+			want: "upstream-org/upstream-repo",
+		},
+		{
+			name: "GitHubIssues with full URL",
+			ts: &kelosv1alpha1.TaskSpawner{
+				Spec: kelosv1alpha1.TaskSpawnerSpec{
+					When: kelosv1alpha1.When{
+						GitHubIssues: &kelosv1alpha1.GitHubIssues{
+							Repo: "https://github.com/upstream-org/upstream-repo.git",
+						},
+					},
+				},
+			},
+			want: "upstream-org/upstream-repo",
+		},
+		{
+			name: "GitHubPullRequests with shorthand",
+			ts: &kelosv1alpha1.TaskSpawner{
+				Spec: kelosv1alpha1.TaskSpawnerSpec{
+					When: kelosv1alpha1.When{
+						GitHubPullRequests: &kelosv1alpha1.GitHubPullRequests{
+							Repo: "upstream-org/upstream-repo",
+						},
+					},
+				},
+			},
+			want: "upstream-org/upstream-repo",
+		},
+		{
+			name: "GitHubPullRequests with GHES URL",
+			ts: &kelosv1alpha1.TaskSpawner{
+				Spec: kelosv1alpha1.TaskSpawnerSpec{
+					When: kelosv1alpha1.When{
+						GitHubPullRequests: &kelosv1alpha1.GitHubPullRequests{
+							Repo: "https://github.example.com/upstream-org/upstream-repo.git",
+						},
+					},
+				},
+			},
+			want: "upstream-org/upstream-repo",
+		},
+		{
+			name: "GitHubIssues with SSH URL",
+			ts: &kelosv1alpha1.TaskSpawner{
+				Spec: kelosv1alpha1.TaskSpawnerSpec{
+					When: kelosv1alpha1.When{
+						GitHubIssues: &kelosv1alpha1.GitHubIssues{
+							Repo: "git@github.com:upstream-org/upstream-repo.git",
+						},
+					},
+				},
+			},
+			want: "upstream-org/upstream-repo",
+		},
+		{
+			name: "No repo override",
+			ts: &kelosv1alpha1.TaskSpawner{
+				Spec: kelosv1alpha1.TaskSpawnerSpec{
+					When: kelosv1alpha1.When{
+						GitHubIssues: &kelosv1alpha1.GitHubIssues{},
+					},
+				},
+			},
+			want: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := deriveUpstreamRepo(tt.ts)
+			if got != tt.want {
+				t.Errorf("deriveUpstreamRepo() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRunCycleWithSource_PropagatesUpstreamRepo(t *testing.T) {
+	ts := &kelosv1alpha1.TaskSpawner{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "spawner",
+			Namespace: "default",
+		},
+		Spec: kelosv1alpha1.TaskSpawnerSpec{
+			When: kelosv1alpha1.When{
+				GitHubIssues: &kelosv1alpha1.GitHubIssues{
+					Repo: "https://github.com/upstream-org/upstream-repo.git",
+				},
+			},
+			TaskTemplate: kelosv1alpha1.TaskTemplate{
+				Type: "claude-code",
+				Credentials: kelosv1alpha1.Credentials{
+					Type:      kelosv1alpha1.CredentialTypeAPIKey,
+					SecretRef: kelosv1alpha1.SecretReference{Name: "my-secret"},
+				},
+			},
+		},
+	}
+	cl, key := setupTest(t, ts)
+
+	src := &fakeSource{
+		items: []source.WorkItem{
+			{ID: "1", Title: "Test issue"},
+		},
+	}
+
+	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	var task kelosv1alpha1.Task
+	if err := cl.Get(context.Background(), types.NamespacedName{Name: "spawner-1", Namespace: "default"}, &task); err != nil {
+		t.Fatalf("Failed to get created task: %v", err)
+	}
+
+	if task.Spec.UpstreamRepo != "upstream-org/upstream-repo" {
+		t.Errorf("task.Spec.UpstreamRepo = %q, want %q", task.Spec.UpstreamRepo, "upstream-org/upstream-repo")
+	}
+}
+
+func TestRunCycleWithSource_ExplicitUpstreamRepoTakesPrecedence(t *testing.T) {
+	ts := &kelosv1alpha1.TaskSpawner{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "spawner",
+			Namespace: "default",
+		},
+		Spec: kelosv1alpha1.TaskSpawnerSpec{
+			When: kelosv1alpha1.When{
+				GitHubIssues: &kelosv1alpha1.GitHubIssues{
+					Repo: "https://github.com/upstream-org/upstream-repo.git",
+				},
+			},
+			TaskTemplate: kelosv1alpha1.TaskTemplate{
+				Type: "claude-code",
+				Credentials: kelosv1alpha1.Credentials{
+					Type:      kelosv1alpha1.CredentialTypeAPIKey,
+					SecretRef: kelosv1alpha1.SecretReference{Name: "my-secret"},
+				},
+				UpstreamRepo: "explicit-org/explicit-repo",
+			},
+		},
+	}
+	cl, key := setupTest(t, ts)
+
+	src := &fakeSource{
+		items: []source.WorkItem{
+			{ID: "1", Title: "Test issue"},
+		},
+	}
+
+	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	var task kelosv1alpha1.Task
+	if err := cl.Get(context.Background(), types.NamespacedName{Name: "spawner-1", Namespace: "default"}, &task); err != nil {
+		t.Fatalf("Failed to get created task: %v", err)
+	}
+
+	if task.Spec.UpstreamRepo != "explicit-org/explicit-repo" {
+		t.Errorf("task.Spec.UpstreamRepo = %q, want %q", task.Spec.UpstreamRepo, "explicit-org/explicit-repo")
+	}
+}
+
+func TestSourceAnnotations_GitHubIssues(t *testing.T) {
+	ts := &kelosv1alpha1.TaskSpawner{
+		Spec: kelosv1alpha1.TaskSpawnerSpec{
+			When: kelosv1alpha1.When{
+				GitHubIssues: &kelosv1alpha1.GitHubIssues{},
+			},
+		},
+	}
+
+	item := source.WorkItem{
+		ID:     "42",
+		Number: 42,
+		Kind:   "Issue",
+	}
+
+	annotations := sourceAnnotations(ts, item)
+	if annotations == nil {
+		t.Fatal("Expected annotations, got nil")
+	}
+	if annotations[reporting.AnnotationSourceKind] != "issue" {
+		t.Errorf("Expected source-kind 'issue', got %q", annotations[reporting.AnnotationSourceKind])
+	}
+	if annotations[reporting.AnnotationSourceNumber] != "42" {
+		t.Errorf("Expected source-number '42', got %q", annotations[reporting.AnnotationSourceNumber])
+	}
+	if _, ok := annotations[reporting.AnnotationGitHubReporting]; ok {
+		t.Error("Expected no github-reporting annotation when reporting is not enabled")
+	}
+}
+
+func TestSourceAnnotations_GitHubPR(t *testing.T) {
+	ts := &kelosv1alpha1.TaskSpawner{
+		Spec: kelosv1alpha1.TaskSpawnerSpec{
+			When: kelosv1alpha1.When{
+				GitHubPullRequests: &kelosv1alpha1.GitHubPullRequests{},
+			},
+		},
+	}
+
+	item := source.WorkItem{
+		ID:     "7",
+		Number: 7,
+		Kind:   "PR",
+	}
+
+	annotations := sourceAnnotations(ts, item)
+	if annotations == nil {
+		t.Fatal("Expected annotations, got nil")
+	}
+	if annotations[reporting.AnnotationSourceKind] != "pull-request" {
+		t.Errorf("Expected source-kind 'pull-request', got %q", annotations[reporting.AnnotationSourceKind])
+	}
+	if annotations[reporting.AnnotationSourceNumber] != "7" {
+		t.Errorf("Expected source-number '7', got %q", annotations[reporting.AnnotationSourceNumber])
+	}
+}
+
+func TestSourceAnnotations_ReportingEnabled(t *testing.T) {
+	ts := &kelosv1alpha1.TaskSpawner{
+		Spec: kelosv1alpha1.TaskSpawnerSpec{
+			When: kelosv1alpha1.When{
+				GitHubIssues: &kelosv1alpha1.GitHubIssues{
+					Reporting: &kelosv1alpha1.GitHubReporting{
+						Enabled: true,
+					},
+				},
+			},
+		},
+	}
+
+	item := source.WorkItem{
+		ID:     "1",
+		Number: 1,
+		Kind:   "Issue",
+	}
+
+	annotations := sourceAnnotations(ts, item)
+	if annotations[reporting.AnnotationGitHubReporting] != "enabled" {
+		t.Errorf("Expected github-reporting 'enabled', got %q", annotations[reporting.AnnotationGitHubReporting])
+	}
+}
+
+func TestSourceAnnotations_ReportingEnabledPR(t *testing.T) {
+	ts := &kelosv1alpha1.TaskSpawner{
+		Spec: kelosv1alpha1.TaskSpawnerSpec{
+			When: kelosv1alpha1.When{
+				GitHubPullRequests: &kelosv1alpha1.GitHubPullRequests{
+					Reporting: &kelosv1alpha1.GitHubReporting{
+						Enabled: true,
+					},
+				},
+			},
+		},
+	}
+
+	item := source.WorkItem{
+		ID:     "5",
+		Number: 5,
+		Kind:   "PR",
+	}
+
+	annotations := sourceAnnotations(ts, item)
+	if annotations[reporting.AnnotationGitHubReporting] != "enabled" {
+		t.Errorf("Expected github-reporting 'enabled', got %q", annotations[reporting.AnnotationGitHubReporting])
+	}
+}
+
+func TestSourceAnnotations_NonGitHub(t *testing.T) {
+	ts := &kelosv1alpha1.TaskSpawner{
+		Spec: kelosv1alpha1.TaskSpawnerSpec{
+			When: kelosv1alpha1.When{
+				Jira: &kelosv1alpha1.Jira{},
+			},
+		},
+	}
+
+	item := source.WorkItem{
+		ID:     "1",
+		Number: 1,
+	}
+
+	annotations := sourceAnnotations(ts, item)
+	if annotations != nil {
+		t.Errorf("Expected nil annotations for non-GitHub source, got %v", annotations)
+	}
+}
+
+func TestRunCycleWithSource_AnnotationsStamped(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+	ts.Spec.When.GitHubIssues.Reporting = &kelosv1alpha1.GitHubReporting{Enabled: true}
+	cl, key := setupTest(t, ts)
+
+	src := &fakeSource{
+		items: []source.WorkItem{
+			{ID: "42", Number: 42, Title: "Test Issue", Kind: "Issue"},
+		},
+	}
+
+	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	var task kelosv1alpha1.Task
+	if err := cl.Get(context.Background(), types.NamespacedName{Name: "spawner-42", Namespace: "default"}, &task); err != nil {
+		t.Fatalf("Failed to get created task: %v", err)
+	}
+
+	if task.Annotations[reporting.AnnotationSourceKind] != "issue" {
+		t.Errorf("Expected source-kind 'issue', got %q", task.Annotations[reporting.AnnotationSourceKind])
+	}
+	if task.Annotations[reporting.AnnotationSourceNumber] != "42" {
+		t.Errorf("Expected source-number '42', got %q", task.Annotations[reporting.AnnotationSourceNumber])
+	}
+	if task.Annotations[reporting.AnnotationGitHubReporting] != "enabled" {
+		t.Errorf("Expected github-reporting 'enabled', got %q", task.Annotations[reporting.AnnotationGitHubReporting])
+	}
+}
+
+func TestReportingEnabled_IssuesEnabled(t *testing.T) {
+	ts := &kelosv1alpha1.TaskSpawner{
+		Spec: kelosv1alpha1.TaskSpawnerSpec{
+			When: kelosv1alpha1.When{
+				GitHubIssues: &kelosv1alpha1.GitHubIssues{
+					Reporting: &kelosv1alpha1.GitHubReporting{Enabled: true},
+				},
+			},
+		},
+	}
+	if !reportingEnabled(ts) {
+		t.Error("Expected reporting to be enabled")
+	}
+}
+
+func TestReportingEnabled_IssuesDisabled(t *testing.T) {
+	ts := &kelosv1alpha1.TaskSpawner{
+		Spec: kelosv1alpha1.TaskSpawnerSpec{
+			When: kelosv1alpha1.When{
+				GitHubIssues: &kelosv1alpha1.GitHubIssues{
+					Reporting: &kelosv1alpha1.GitHubReporting{Enabled: false},
+				},
+			},
+		},
+	}
+	if reportingEnabled(ts) {
+		t.Error("Expected reporting to be disabled")
+	}
+}
+
+func TestReportingEnabled_NoReportingField(t *testing.T) {
+	ts := &kelosv1alpha1.TaskSpawner{
+		Spec: kelosv1alpha1.TaskSpawnerSpec{
+			When: kelosv1alpha1.When{
+				GitHubIssues: &kelosv1alpha1.GitHubIssues{},
+			},
+		},
+	}
+	if reportingEnabled(ts) {
+		t.Error("Expected reporting to be disabled when Reporting is nil")
+	}
+}
+
+func TestReportingEnabled_PREnabled(t *testing.T) {
+	ts := &kelosv1alpha1.TaskSpawner{
+		Spec: kelosv1alpha1.TaskSpawnerSpec{
+			When: kelosv1alpha1.When{
+				GitHubPullRequests: &kelosv1alpha1.GitHubPullRequests{
+					Reporting: &kelosv1alpha1.GitHubReporting{Enabled: true},
+				},
+			},
+		},
+	}
+	if !reportingEnabled(ts) {
+		t.Error("Expected reporting to be enabled for PRs")
+	}
+}
+
+func TestReportingEnabled_Jira(t *testing.T) {
+	ts := &kelosv1alpha1.TaskSpawner{
+		Spec: kelosv1alpha1.TaskSpawnerSpec{
+			When: kelosv1alpha1.When{
+				Jira: &kelosv1alpha1.Jira{},
+			},
+		},
+	}
+	if reportingEnabled(ts) {
+		t.Error("Expected reporting to be disabled for Jira source")
+	}
+}
+
+func TestRunReportingCycle_ReportsForAnnotatedTasks(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+	ts.Spec.When.GitHubIssues.Reporting = &kelosv1alpha1.GitHubReporting{Enabled: true}
+
+	// Create a task with reporting annotations and a Pending phase
+	task := kelosv1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "spawner-1",
+			Namespace: "default",
+			Labels: map[string]string{
+				"kelos.dev/taskspawner": "spawner",
+			},
+			Annotations: map[string]string{
+				reporting.AnnotationGitHubReporting: "enabled",
+				reporting.AnnotationSourceNumber:    "42",
+				reporting.AnnotationSourceKind:      "issue",
+			},
+		},
+		Spec: kelosv1alpha1.TaskSpec{
+			Type:   "claude-code",
+			Prompt: "test",
+			Credentials: kelosv1alpha1.Credentials{
+				Type:      kelosv1alpha1.CredentialTypeOAuth,
+				SecretRef: kelosv1alpha1.SecretReference{Name: "creds"},
+			},
+		},
+		Status: kelosv1alpha1.TaskStatus{
+			Phase: kelosv1alpha1.TaskPhasePending,
+		},
+	}
+
+	cl, key := setupTest(t, ts, task)
+
+	// Set up a fake GitHub server
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]int64{"id": 999})
+	}))
+	defer server.Close()
+
+	reporter := &reporting.TaskReporter{
+		Client: cl,
+		Reporter: &reporting.GitHubReporter{
+			Owner:   "owner",
+			Repo:    "repo",
+			Token:   "token",
+			BaseURL: server.URL,
+		},
+	}
+
+	if err := runReportingCycle(context.Background(), cl, key, reporter); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// Verify annotations were updated
+	var updated kelosv1alpha1.Task
+	if err := cl.Get(context.Background(), client.ObjectKeyFromObject(&task), &updated); err != nil {
+		t.Fatalf("Getting updated task: %v", err)
+	}
+	if updated.Annotations[reporting.AnnotationGitHubReportPhase] != "accepted" {
+		t.Errorf("Expected report phase 'accepted', got %q", updated.Annotations[reporting.AnnotationGitHubReportPhase])
+	}
+	if updated.Annotations[reporting.AnnotationGitHubCommentID] == "" {
+		t.Error("Expected comment ID to be set")
+	}
+}
+
+func TestRunReportingCycle_SkipsTasksWithoutReporting(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+
+	// Task without reporting annotations
+	task := kelosv1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "spawner-1",
+			Namespace: "default",
+			Labels: map[string]string{
+				"kelos.dev/taskspawner": "spawner",
+			},
+		},
+		Spec: kelosv1alpha1.TaskSpec{
+			Type:   "claude-code",
+			Prompt: "test",
+			Credentials: kelosv1alpha1.Credentials{
+				Type:      kelosv1alpha1.CredentialTypeOAuth,
+				SecretRef: kelosv1alpha1.SecretReference{Name: "creds"},
+			},
+		},
+		Status: kelosv1alpha1.TaskStatus{
+			Phase: kelosv1alpha1.TaskPhasePending,
+		},
+	}
+
+	cl, key := setupTest(t, ts, task)
+
+	// Server should never be called
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("GitHub API should not be called for tasks without reporting")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	reporter := &reporting.TaskReporter{
+		Client: cl,
+		Reporter: &reporting.GitHubReporter{
+			Owner:   "owner",
+			Repo:    "repo",
+			Token:   "token",
+			BaseURL: server.URL,
+		},
+	}
+
+	if err := runReportingCycle(context.Background(), cl, key, reporter); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+}
+
+func TestRunOnce_ReturnsPollIntervalForSuspendedTaskSpawner(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+	ts.Spec.Suspend = boolPtr(true)
+	ts.Spec.PollInterval = "30s"
+
+	cl, key := setupTest(t, ts)
+
+	interval, err := runOnce(context.Background(), cl, key, spawnerRuntimeConfig{})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if interval != 30*time.Second {
+		t.Fatalf("Interval = %v, want %v", interval, 30*time.Second)
+	}
+
+	var updated kelosv1alpha1.TaskSpawner
+	if err := cl.Get(context.Background(), key, &updated); err != nil {
+		t.Fatalf("Getting updated TaskSpawner: %v", err)
+	}
+	if updated.Status.Phase != kelosv1alpha1.TaskSpawnerPhaseSuspended {
+		t.Fatalf("Phase = %q, want %q", updated.Status.Phase, kelosv1alpha1.TaskSpawnerPhaseSuspended)
+	}
+}
+
+func TestRunOnce_UsesEnvTokenForReporting(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "pat-token")
+
+	ts := newTaskSpawner("spawner", "default", nil)
+	ts.Spec.Suspend = boolPtr(true)
+	ts.Spec.When.GitHubIssues.Reporting = &kelosv1alpha1.GitHubReporting{Enabled: true}
+
+	task := newTask("spawner-1", "default", "spawner", kelosv1alpha1.TaskPhasePending)
+	task.Annotations = map[string]string{
+		reporting.AnnotationGitHubReporting: "enabled",
+		reporting.AnnotationSourceNumber:    "42",
+		reporting.AnnotationSourceKind:      "issue",
+	}
+
+	cl, key := setupTest(t, ts, task)
+
+	var gotAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]int64{"id": 999})
+	}))
+	defer server.Close()
+
+	_, err := runOnce(context.Background(), cl, key, spawnerRuntimeConfig{
+		GitHubOwner:      "owner",
+		GitHubRepo:       "repo",
+		GitHubAPIBaseURL: server.URL,
+	})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	if gotAuth != "token pat-token" {
+		t.Fatalf("Authorization = %q, want %q", gotAuth, "token pat-token")
+	}
+}
+
+func TestSpawnerReconcilerTaskSpawnerPredicate(t *testing.T) {
+	key := types.NamespacedName{Name: "spawner", Namespace: "default"}
+	r := &spawnerReconciler{Key: key}
+	p := r.taskSpawnerPredicate()
+
+	target := &kelosv1alpha1.TaskSpawner{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       key.Name,
+			Namespace:  key.Namespace,
+			Generation: 1,
+		},
+	}
+	if !p.Create(event.CreateEvent{Object: target}) {
+		t.Fatal("Expected create event for target TaskSpawner to pass predicate")
+	}
+
+	other := target.DeepCopy()
+	other.Name = "other"
+	if p.Create(event.CreateEvent{Object: other}) {
+		t.Fatal("Expected create event for other TaskSpawner to be ignored")
+	}
+
+	updated := target.DeepCopy()
+	updated.Generation = 2
+	if !p.Update(event.UpdateEvent{ObjectOld: target, ObjectNew: updated}) {
+		t.Fatal("Expected generation change to pass predicate")
+	}
+
+	statusOnly := updated.DeepCopy()
+	statusOnly.Status.Phase = kelosv1alpha1.TaskSpawnerPhaseRunning
+	if p.Update(event.UpdateEvent{ObjectOld: updated, ObjectNew: statusOnly}) {
+		t.Fatal("Expected status-only update to be ignored")
+	}
+}
+
+func TestSpawnerReconcilerTaskPredicate(t *testing.T) {
+	key := types.NamespacedName{Name: "spawner", Namespace: "default"}
+	r := &spawnerReconciler{Key: key}
+	p := r.taskPredicate()
+
+	base := newTask("spawner-1", "default", "spawner", kelosv1alpha1.TaskPhasePending)
+	oldTask := base.DeepCopy()
+	phaseChanged := base.DeepCopy()
+	phaseChanged.Status.Phase = kelosv1alpha1.TaskPhaseSucceeded
+
+	if !p.Update(event.UpdateEvent{ObjectOld: oldTask, ObjectNew: phaseChanged}) {
+		t.Fatal("Expected phase change to pass predicate")
+	}
+
+	annotationOnly := base.DeepCopy()
+	annotationOnly.Annotations = map[string]string{"kelos.dev/test": "value"}
+	if p.Update(event.UpdateEvent{ObjectOld: oldTask, ObjectNew: annotationOnly}) {
+		t.Fatal("Expected annotation-only update to be ignored")
+	}
+
+	if p.Create(event.CreateEvent{Object: base.DeepCopy()}) {
+		t.Fatal("Expected task create event to be ignored")
+	}
+	if !p.Delete(event.DeleteEvent{Object: base.DeepCopy()}) {
+		t.Fatal("Expected matching task delete event to pass predicate")
+	}
+
+	otherSpawnerTask := newTask("other-1", "default", "other", kelosv1alpha1.TaskPhasePending)
+	if p.Delete(event.DeleteEvent{Object: otherSpawnerTask.DeepCopy()}) {
+		t.Fatal("Expected other spawner task delete event to be ignored")
+	}
+}
+
+func TestSpawnerReconcilerRequestsForTask(t *testing.T) {
+	key := types.NamespacedName{Name: "spawner", Namespace: "default"}
+	r := &spawnerReconciler{Key: key}
+
+	task := newTask("spawner-1", "default", "spawner", kelosv1alpha1.TaskPhasePending)
+	requests := r.requestsForTask(context.Background(), task.DeepCopy())
+	if len(requests) != 1 {
+		t.Fatalf("Expected 1 request, got %d", len(requests))
+	}
+	if requests[0].NamespacedName != key {
+		t.Fatalf("Request key = %v, want %v", requests[0].NamespacedName, key)
+	}
+
+	other := newTask("other-1", "default", "other", kelosv1alpha1.TaskPhasePending)
+	requests = r.requestsForTask(context.Background(), other.DeepCopy())
+	if len(requests) != 0 {
+		t.Fatalf("Expected no requests for non-matching task, got %d", len(requests))
+	}
+}
+
+func TestResolvedPollInterval_SourceOverridesRoot(t *testing.T) {
+	ts := &kelosv1alpha1.TaskSpawner{
+		Spec: kelosv1alpha1.TaskSpawnerSpec{
+			When: kelosv1alpha1.When{
+				GitHubIssues: &kelosv1alpha1.GitHubIssues{
+					PollInterval: "10s",
+				},
+			},
+			PollInterval: "5m",
+		},
+	}
+	got := resolvedPollInterval(ts)
+	if got != 10*time.Second {
+		t.Fatalf("resolvedPollInterval = %v, want %v", got, 10*time.Second)
+	}
+}
+
+func TestResolvedPollInterval_FallsBackToRoot(t *testing.T) {
+	ts := &kelosv1alpha1.TaskSpawner{
+		Spec: kelosv1alpha1.TaskSpawnerSpec{
+			When: kelosv1alpha1.When{
+				GitHubIssues: &kelosv1alpha1.GitHubIssues{},
+			},
+			PollInterval: "2m",
+		},
+	}
+	got := resolvedPollInterval(ts)
+	if got != 2*time.Minute {
+		t.Fatalf("resolvedPollInterval = %v, want %v", got, 2*time.Minute)
+	}
+}
+
+func TestResolvedPollInterval_BothEmptyDefaultsFiveMinutes(t *testing.T) {
+	ts := &kelosv1alpha1.TaskSpawner{
+		Spec: kelosv1alpha1.TaskSpawnerSpec{
+			When: kelosv1alpha1.When{
+				GitHubIssues: &kelosv1alpha1.GitHubIssues{},
+			},
+		},
+	}
+	got := resolvedPollInterval(ts)
+	if got != 5*time.Minute {
+		t.Fatalf("resolvedPollInterval = %v, want %v", got, 5*time.Minute)
+	}
+}
+
+func TestResolvedPollInterval_PullRequestsSourceOverride(t *testing.T) {
+	ts := &kelosv1alpha1.TaskSpawner{
+		Spec: kelosv1alpha1.TaskSpawnerSpec{
+			When: kelosv1alpha1.When{
+				GitHubPullRequests: &kelosv1alpha1.GitHubPullRequests{
+					PollInterval: "45s",
+				},
+			},
+			PollInterval: "5m",
+		},
+	}
+	got := resolvedPollInterval(ts)
+	if got != 45*time.Second {
+		t.Fatalf("resolvedPollInterval = %v, want %v", got, 45*time.Second)
+	}
+}
+
+func TestResolvedPollInterval_JiraSourceOverride(t *testing.T) {
+	ts := &kelosv1alpha1.TaskSpawner{
+		Spec: kelosv1alpha1.TaskSpawnerSpec{
+			When: kelosv1alpha1.When{
+				Jira: &kelosv1alpha1.Jira{
+					BaseURL:      "https://example.atlassian.net",
+					Project:      "TEST",
+					SecretRef:    kelosv1alpha1.SecretReference{Name: "jira-creds"},
+					PollInterval: "1m",
+				},
+			},
+			PollInterval: "10m",
+		},
+	}
+	got := resolvedPollInterval(ts)
+	if got != 1*time.Minute {
+		t.Fatalf("resolvedPollInterval = %v, want %v", got, 1*time.Minute)
+	}
+}
+
+func TestResolvedPollInterval_CronUsesRootLevel(t *testing.T) {
+	ts := &kelosv1alpha1.TaskSpawner{
+		Spec: kelosv1alpha1.TaskSpawnerSpec{
+			When: kelosv1alpha1.When{
+				Cron: &kelosv1alpha1.Cron{
+					Schedule: "0 * * * *",
+				},
+			},
+			PollInterval: "3m",
+		},
+	}
+	got := resolvedPollInterval(ts)
+	if got != 3*time.Minute {
+		t.Fatalf("resolvedPollInterval = %v, want %v", got, 3*time.Minute)
+	}
+}
+
+func TestRunOnce_ReturnsSourcePollInterval(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+	ts.Spec.Suspend = boolPtr(true)
+	ts.Spec.PollInterval = "5m"
+	ts.Spec.When.GitHubIssues.PollInterval = "15s"
+
+	cl, key := setupTest(t, ts)
+
+	interval, err := runOnce(context.Background(), cl, key, spawnerRuntimeConfig{})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if interval != 15*time.Second {
+		t.Fatalf("Interval = %v, want %v", interval, 15*time.Second)
+	}
+}

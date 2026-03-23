@@ -1,0 +1,129 @@
+apiVersion: kelos.dev/v1alpha1
+kind: AgentConfig
+metadata:
+  name: kelos-workers-agent
+spec:
+  agentsMD: |
+    # Kelos Worker Agent
+
+    ## Environment
+    You are running in an ephemeral container environment. Your file system
+    changes disappear after the task completes. Persist work by creating PRs,
+    issues, or comments.
+
+    ## Identity
+    - When commenting on issues or PRs, always start with "🤖 **Kelos Worker Agent** @gjkim42\n\n"
+      so it is clearly distinguishable from human comments and triggers a notification
+
+    ## Standards
+    - Do not create duplicate issues — check existing issues first with `gh issue list`
+    - Keep changes minimal and focused
+
+    ## Project Conventions
+    - Use Makefile targets instead of discovering build/test commands yourself:
+      - `make verify` — run all verification checks (lint, fmt, vet, etc.)
+      - `make update` — update all generated files
+      - `make test` — run all unit tests
+      - `make test-integration` — run integration tests
+      - `make build` — build binary
+    - Always try to add or improve tests when modifying code
+    - Logging conventions: start log messages with capital letters and do not end with punctuation
+    - Commit messages: do not include PR links in commit messages
+---
+apiVersion: kelos.dev/v1alpha1
+kind: TaskSpawner
+metadata:
+  name: kelos-workers
+spec:
+  when:
+    githubIssues:
+      labels:
+        - actor/kelos
+      commentPolicy:
+        triggerComment: "/kelos pick-up"
+        excludeComments:
+          - "/kelos needs-input"
+        allowedUsers:
+          - gjkim42
+          - kelos-bot[bot]
+      reporting:
+        enabled: true
+      priorityLabels:
+        - priority/critical-urgent
+        - priority/important-soon
+        - priority/important-longterm
+        - priority/backlog
+      pollInterval: 1m
+  maxConcurrency: 3
+  taskTemplate:
+    workspaceRef:
+      name: kelos-agent
+    model: opus
+    type: claude-code
+    ttlSecondsAfterFinished: 3600
+    credentials:
+      type: oauth
+      secretRef:
+        name: kelos-credentials
+    podOverrides:
+      resources:
+        requests:
+          cpu: "250m"
+          memory: "512Mi"
+          ephemeral-storage: "4Gi"
+        limits:
+          ephemeral-storage: "4Gi"
+      env:
+        - name: GIT_AUTHOR_NAME
+          value: "Gunju Kim"
+        - name: GIT_AUTHOR_EMAIL
+          value: "gjkim042@gmail.com"
+        - name: GIT_COMMITTER_NAME
+          value: "Gunju Kim"
+        - name: GIT_COMMITTER_EMAIL
+          value: "gjkim042@gmail.com"
+    branch: "kelos-task-{{.Number}}"
+    agentConfigRef:
+      name: kelos-workers-agent
+    promptTemplate: |
+      You are a coding agent. You either
+      - create a PR to fix the issue
+      - update an existing PR to fix the issue
+      - comment on the issue or the PR if you cannot fix it
+
+      Task:
+      - 0. Set up your working branch. Run this exactly:
+        ```
+        git fetch --unshallow || true; git fetch origin main; git rebase origin/main
+        ```
+      - 1. Check if a PR already exists for branch kelos-task-{{.Number}}.
+
+      If a PR already exists:
+      - 2a. Read ALL review comments and conversation on the PR (gh pr view, gh api for review comments).
+        - Also read ALL comments on the linked issue (gh issue view {{.Number}} --comments), not just the PR.
+      - 3a. Read the existing diff (git diff main...HEAD) to understand what has already been done. Do NOT start over or rewrite from scratch.
+      - 4a. Make only the incremental changes needed to address review feedback or remaining issues. Preserve existing work.
+      - 5a. Commit and push your changes to origin kelos-task-{{.Number}}.
+      - 6a. /review the PR to verify your changes address the feedback. If changes are needed, make them, run `make verify` and `make test`, commit and push, then /review again. Repeat until the review passes.
+      - 7a. Update the PR title and description to reflect the final diff. The PR body MUST contain a standard closing keyword reference on its own line (e.g., `Fixes #{{.Number}}` or `Closes #{{.Number}}`). Do not embed the issue number in natural language. Ensure the PR has labels "generated-by-kelos" and "ok-to-test" (use `gh pr edit {{.Number}} --add-label generated-by-kelos --add-label ok-to-test` if missing).
+      - 8a. After pushing, actively check CI status with `gh pr checks`. If any checks fail, investigate the failures, fix them, commit and push, then check again. Do not request review until CI passes.
+
+      If no PR exists:
+      - 2b. Investigate the issue #{{.Number}}.
+        - Read ALL comments on the issue (gh issue view {{.Number}} --comments), including maintainer feedback and linked issues/PRs.
+        - If previous PRs for this issue were closed, read their reviews to understand why before choosing your approach.
+        - Search the codebase for existing constants, types, and patterns before creating new ones. Do not duplicate definitions.
+        - Only implement what the issue explicitly asks for. If you discover related improvements, create separate issues for them.
+      - 3b. Create a commit that fixes the issue.
+      - 4b. Push your branch to origin kelos-task-{{.Number}}.
+      - 5b. Create a PR with labels "generated-by-kelos" and "ok-to-test" (use `gh pr create --label generated-by-kelos --label ok-to-test`), then /review it. If changes are needed, make them, run `make verify` and `make test`, commit and push, then /review again. Repeat until the review passes.
+      - 6b. Update the PR title and description to reflect the final diff. The PR body MUST contain a standard closing keyword reference on its own line (e.g., `Fixes #{{.Number}}` or `Closes #{{.Number}}`). Do not embed the issue number in natural language.
+      - 7b. After pushing, actively check CI status with `gh pr checks`. If any checks fail, investigate the failures, fix them, commit and push, then check again. Do not request review until CI passes.
+
+      Post-checklist:
+      - Post a `/kelos needs-input` comment on the issue (gh issue comment {{.Number}} --body "/kelos needs-input") and leave a comment for the reason if any of the following applies:
+        - The PR is ready for review, please take a look.
+        - Commented on the issue or the PR for more information.
+        - You cannot make any progress on the issue, explain why.
+      - If you find anything worth considering (e.g. bugs, improvements, follow-up work), create a new issue:
+        - gh issue create --title "<title>" --body "<description>" --label generated-by-kelos

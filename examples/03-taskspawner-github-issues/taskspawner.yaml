@@ -1,0 +1,27 @@
+apiVersion: kelos.dev/v1alpha1
+kind: TaskSpawner
+metadata:
+  name: fix-bugs
+spec:
+  when:
+    githubIssues:
+      labels:
+        - bug
+      state: open
+      pollInterval: 5m
+  taskTemplate:
+    type: claude-code
+    workspaceRef:
+      name: my-workspace
+    credentials:
+      type: oauth
+      secretRef:
+        name: claude-oauth-token
+    promptTemplate: |
+      Fix the following GitHub issue and open a PR with the fix.
+
+      Issue #{{.Number}}: {{.Title}}
+
+      {{.Body}}
+    ttlSecondsAfterFinished: 3600
+  maxConcurrency: 3

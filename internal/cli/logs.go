@@ -1,0 +1,219 @@
+package cli
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/spf13/cobra"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/kubernetes"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	kelosv1alpha1 "github.com/kelos-dev/kelos/api/v1alpha1"
+)
+
+func newLogsCommand(cfg *ClientConfig) *cobra.Command {
+	var follow bool
+
+	cmd := &cobra.Command{
+		Use:   "logs <name>",
+		Short: "View logs from a task's pod",
+		Args: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 0 {
+				return fmt.Errorf("task name is required\nUsage: %s", cmd.Use)
+			}
+			if len(args) > 1 {
+				return fmt.Errorf("too many arguments: expected 1 task name, got %d\nUsage: %s", len(args), cmd.Use)
+			}
+			return nil
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cl, ns, err := cfg.NewClient()
+			if err != nil {
+				return err
+			}
+
+			cs, _, err := cfg.NewClientset()
+			if err != nil {
+				return err
+			}
+
+			ctx := context.Background()
+			task := &kelosv1alpha1.Task{}
+			if err := cl.Get(ctx, client.ObjectKey{Name: args[0], Namespace: ns}, task); err != nil {
+				return fmt.Errorf("getting task: %w", err)
+			}
+
+			podName, err := resolveTaskPodName(ctx, cl, ns, task)
+			if err != nil {
+				return err
+			}
+
+			if podName == "" {
+				if isTerminalTaskPhase(task.Status.Phase) {
+					return fmt.Errorf("task %q has no live pod (task phase: %s)", args[0], task.Status.Phase)
+				}
+				if !follow {
+					return fmt.Errorf("task %q has no pod yet", args[0])
+				}
+
+				fmt.Fprintf(os.Stderr, "Waiting for task %q to start...\n", args[0])
+				task, err = waitForPod(ctx, cl, args[0], ns)
+				if err != nil {
+					return err
+				}
+				podName, err = resolveTaskPodName(ctx, cl, ns, task)
+				if err != nil {
+					return err
+				}
+				if podName == "" {
+					return fmt.Errorf("task %q pod disappeared before logs could be streamed", args[0])
+				}
+			}
+
+			containerName := task.Spec.Type
+
+			if follow && task.Spec.WorkspaceRef != nil {
+				fmt.Fprintf(os.Stderr, "Streaming init container (git-clone) logs...\n")
+				if err := streamLogs(ctx, cs, ns, podName, "git-clone", follow); err != nil {
+					return err
+				}
+			}
+
+			if follow {
+				fmt.Fprintf(os.Stderr, "Streaming container (%s) logs...\n", containerName)
+			}
+			return streamAgentLogs(ctx, cs, ns, podName, containerName, task.Spec.Type, follow)
+		},
+	}
+
+	cmd.Flags().BoolVarP(&follow, "follow", "f", false, "follow log output")
+
+	cmd.ValidArgsFunction = completeTaskNames(cfg)
+
+	return cmd
+}
+
+func waitForPod(ctx context.Context, cl client.Client, name, namespace string) (*kelosv1alpha1.Task, error) {
+	var lastPhase kelosv1alpha1.TaskPhase
+	for {
+		task := &kelosv1alpha1.Task{}
+		if err := cl.Get(ctx, client.ObjectKey{Name: name, Namespace: namespace}, task); err != nil {
+			return nil, fmt.Errorf("getting task: %w", err)
+		}
+
+		if task.Status.Phase != lastPhase {
+			fmt.Fprintf(os.Stderr, "task/%s %s\n", name, task.Status.Phase)
+			lastPhase = task.Status.Phase
+		}
+
+		if task.Status.Phase == kelosv1alpha1.TaskPhaseFailed {
+			msg := "unknown error"
+			if task.Status.Message != "" {
+				msg = task.Status.Message
+			}
+			return nil, fmt.Errorf("task %q failed before starting: %s", name, msg)
+		}
+
+		if task.Status.PodName != "" {
+			return task, nil
+		}
+
+		time.Sleep(2 * time.Second)
+	}
+}
+
+func resolveTaskPodName(ctx context.Context, cl client.Client, namespace string, task *kelosv1alpha1.Task) (string, error) {
+	var pods corev1.PodList
+	if err := cl.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{
+		"kelos.dev/task": task.Name,
+	}); err != nil {
+		if task.Status.PodName != "" {
+			return task.Status.PodName, nil
+		}
+		return "", fmt.Errorf("listing task pods: %w", err)
+	}
+
+	if len(pods.Items) == 0 {
+		return "", nil
+	}
+
+	sort.Slice(pods.Items, func(i, j int) bool {
+		left := pods.Items[i]
+		right := pods.Items[j]
+		if left.CreationTimestamp.Time.Equal(right.CreationTimestamp.Time) {
+			return left.Name < right.Name
+		}
+		return left.CreationTimestamp.Time.Before(right.CreationTimestamp.Time)
+	})
+
+	return pods.Items[len(pods.Items)-1].Name, nil
+}
+
+func isTerminalTaskPhase(phase kelosv1alpha1.TaskPhase) bool {
+	return phase == kelosv1alpha1.TaskPhaseSucceeded || phase == kelosv1alpha1.TaskPhaseFailed
+}
+
+func streamLogs(ctx context.Context, cs *kubernetes.Clientset, namespace, podName, container string, follow bool) error {
+	opts := &corev1.PodLogOptions{
+		Follow:    follow,
+		Container: container,
+	}
+
+	for {
+		stream, err := cs.CoreV1().Pods(namespace).GetLogs(podName, opts).Stream(ctx)
+		if err != nil {
+			if follow && isContainerNotReady(err) {
+				time.Sleep(2 * time.Second)
+				continue
+			}
+			return fmt.Errorf("streaming logs: %w", err)
+		}
+		defer stream.Close()
+
+		if _, err := io.Copy(os.Stdout, stream); err != nil {
+			return fmt.Errorf("reading logs: %w", err)
+		}
+		return nil
+	}
+}
+
+func streamAgentLogs(ctx context.Context, cs *kubernetes.Clientset, namespace, podName, container, agentType string, follow bool) error {
+	opts := &corev1.PodLogOptions{
+		Follow:    follow,
+		Container: container,
+	}
+
+	for {
+		stream, err := cs.CoreV1().Pods(namespace).GetLogs(podName, opts).Stream(ctx)
+		if err != nil {
+			if follow && isContainerNotReady(err) {
+				time.Sleep(2 * time.Second)
+				continue
+			}
+			return fmt.Errorf("streaming logs: %w", err)
+		}
+		defer stream.Close()
+
+		switch agentType {
+		case "codex":
+			return ParseAndFormatCodexLogs(stream, os.Stdout, os.Stderr)
+		case "gemini":
+			return ParseAndFormatGeminiLogs(stream, os.Stdout, os.Stderr)
+		case "opencode":
+			return ParseAndFormatOpenCodeLogs(stream, os.Stdout, os.Stderr)
+		default:
+			return ParseAndFormatLogs(stream, os.Stdout, os.Stderr)
+		}
+	}
+}
+
+func isContainerNotReady(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "is waiting to start") || strings.Contains(msg, "PodInitializing")
+}
